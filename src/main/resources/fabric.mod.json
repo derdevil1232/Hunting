@@ -1,25 +1,23 @@
 {
   "schemaVersion": 1,
-  "id": "addon-template",
+  "id": "hunter",
   "version": "${version}",
-  "name": "Addon Template",
-  "description": "An addon template for Meteor Client addons.",
+  "name": "Hunter",
+  "description": "An addon for Meteor Client focused on hunting spawners.",
   "authors": [
-    "seasnail"
+    "c3"
   ],
   "contact": {
-    "sources": "https://github.com/MeteorDevelopment/meteor-addon-template"
+    "sources": "https://github.com/Meteor-Hunting/Hunting.git"
   },
   "icon": "assets/template/icon.png",
   "environment": "client",
   "entrypoints": {
     "meteor": [
-      "com.example.addon.AddonTemplate"
+      "com.spawner.hunt.Hunters"
     ]
   },
-  "mixins": [
-    "addon-template.mixins.json"
-  ],
+  "accessWidener": "hunters.accesswidener",
   "custom": {
     "meteor-client:color": "225,25,25",
     "modmenu": {

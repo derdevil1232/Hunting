@@ -7,7 +7,9 @@ base {
     version = libs.versions.mod.version.get()
     group = properties["maven_group"] as String
 }
-
+loom {
+    accessWidenerPath.set(file("src/main/resources/hunters.accesswidener"))
+}
 repositories {
     maven {
         name = "meteor-maven"
