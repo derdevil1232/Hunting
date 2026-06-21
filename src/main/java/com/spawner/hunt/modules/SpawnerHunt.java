@@ -206,7 +206,6 @@ public class SpawnerHunt extends Module {
     private int pickupPathRefreshTicks;
     private int ticksSincePathRefresh;
     private int silkWarningCooldown;
-    private boolean isMoving;
 
     public SpawnerHunt() {
         super(Categories.Misc, "SpawnerHunt", "Routes to and mines mob spawners filtered by mob type.");
@@ -247,7 +246,7 @@ public class SpawnerHunt extends Module {
             handleRtpGui();
         }
 
-        if (PathManagers.get().isPathing()) {
+        if (PathManagers.get().isPathing() && pathOwnedByModule) {
             handleStuckDetection();
         } else {
             resetStuckDetection();
@@ -436,6 +435,7 @@ public class SpawnerHunt extends Module {
             if (stuckTimer >= STUCK_CHECK_INTERVAL) {
                 if (firstStuckCheckPos == null) {
                     firstStuckCheckPos = currentPos.immutable();
+                    stuckTimer = 0;
                 } else {
                     if (currentPos.equals(firstStuckCheckPos)) {
                         // Same position after 10 seconds
@@ -510,8 +510,6 @@ public class SpawnerHunt extends Module {
 
     private int rtpCooldown;
 
-    private int chestSlot;
-
     private void handleRtpGui() {
         if (mc.player == null) return;
         if (mc.player.containerMenu == null) return;
@@ -520,12 +518,12 @@ public class SpawnerHunt extends Module {
         if (mc.player.containerMenu == mc.player.inventoryMenu) return;
 
         // 2. Ensure the GUI has enough slots
-        if (mc.player.containerMenu.slots.size() <= 27) return;
+        if (mc.player.containerMenu.slots.size() == 27) return;
 
         // 3. The GUI is open! Increment the tick counter.
         rtpGuiWaitTicks++;
 
-        chestSlot = rtpChestSlot.get();
+        int chestSlot = rtpChestSlot.get();
 
         // 4. If we haven't waited 10 ticks yet, return and wait for the next tick.
         if (rtpGuiWaitTicks < 10) return;
@@ -536,7 +534,7 @@ public class SpawnerHunt extends Module {
         // 6. Reset the states for the next time you RTP
         waitingForRtpGui = false;
         waitingForTeleport = true;
-        rtpGuiWaitTicks = 250;
+        rtpGuiWaitTicks = 0;
     }
 
     private void rtpPlayer() {
