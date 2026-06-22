@@ -192,7 +192,7 @@ public class SpawnerHunt extends Module {
         .build()
     );
 
-    private final List<BlockPos> matchingSpawners = new ArrayList<>();
+    private final List<BlockPos> matchingSpawners = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final Map<BlockPos, String> fallbackEntityIdCache = new HashMap<>();
 
     private BlockPos currentTarget;
@@ -201,11 +201,13 @@ public class SpawnerHunt extends Module {
     private boolean pathOwnedByModule;
     private boolean warnedBaritoneUnavailable;
     private int expectedSpawnerItemCount;
-    private int exploreTicks;
     private int pickupTicks;
     private int pickupPathRefreshTicks;
     private int ticksSincePathRefresh;
     private int silkWarningCooldown;
+    private int spawnerScanCooldown;
+    private int waitingForTeleportTicks;
+
 
     public SpawnerHunt() {
         super(Categories.Misc, "SpawnerHunt", "Routes to and mines mob spawners filtered by mob type.");
@@ -227,6 +229,16 @@ public class SpawnerHunt extends Module {
         waitingForConfirmation = false;
         playerIsStuck = false;
         waitingForTeleport = false;
+        waitingForRtpGui = false;
+        rtpGuiWaitTicks = 0;
+        rtpCooldown = 0;
+        rtpStartPos = null;
+        recoveryMineRangeActive = false;
+        unreachableSpawners.clear();     // add
+        recoveryAttemptsForTarget = 0;   // add
+        spawnerScanCooldown = 0;
+        waitingForTeleportTicks = 0;
+
     }
 
     @EventHandler
@@ -256,11 +268,22 @@ public class SpawnerHunt extends Module {
             doRecovery();
         }
 
+        spawnerScanCooldown++;
+
+        if (spawnerScanCooldown >= 10) {
+            spawnerScanCooldown = 0;
+            updateMatchingSpawners();
+        }
+
+
         if (waitingForTeleport && rtpStartPos != null) {
+            waitingForTeleportTicks++;
             double dist = mc.player.position().distanceTo(rtpStartPos);
 
-            if (dist > 50) {
+            if (dist > 50 || waitingForTeleportTicks > 400) {
                 waitingForTeleport = false;
+                waitingForTeleportTicks = 0;
+                unreachableSpawners.clear();
                 info("RTP completed.");
             }
         }
@@ -274,7 +297,6 @@ public class SpawnerHunt extends Module {
 
         if (verifySpawnerPickup.get() && handlePickupVerification()) return;
 
-        updateMatchingSpawners();
 
         if (!useBaritone.get()) {
             currentTarget = null;
@@ -326,11 +348,14 @@ public class SpawnerHunt extends Module {
             return;
         }
 
-        if (currentTarget == null || !matchingSpawners.contains(currentTarget)) {
-            currentTarget = nearest;
+
+        if (currentTarget == null
+            || !matchingSpawners.contains(currentTarget)
+            || !mc.level.getWorldBorder().isWithinBounds(currentTarget)) {
+            setCurrentTarget(nearest); // was: currentTarget = nearest;
             pathToCurrentTarget();
         } else if (dynamicReroute.get() && shouldReroute(nearest)) {
-            currentTarget = nearest;
+            setCurrentTarget(nearest); // was: currentTarget = nearest;
             pathToCurrentTarget();
         } else if (!isWithinMineRange(currentTarget)) {
             ticksSincePathRefresh++;
@@ -383,10 +408,18 @@ public class SpawnerHunt extends Module {
             return true;
         }
 
+        // If already within Minecraft's auto-collect range (~2 blocks), just
+        // wait — repathing to the same spot causes Baritone to immediately stop
+        // without actually moving the player onto the item.
+        double dropDistSq = mc.player.distanceToSqr(drop.getX(), drop.getY(), drop.getZ());
+        if (dropDistSq <= 4.0) {
+            return true;
+        }
+
         if (BaritoneUtils.IS_AVAILABLE) {
             pickupPathRefreshTicks++;
 
-            if (!PathManagers.get().isPathing() || pickupPathRefreshTicks >= repathDelay.get()) {
+            if (!PathManagers.get().isPathing() || pickupPathRefreshTicks >= 5) { // 5 ticks, not repathDelay
                 PathManagers.get().moveTo(drop.blockPosition(), false);
                 pathOwnedByModule = true;
                 pickupPathRefreshTicks = 0;
@@ -399,15 +432,15 @@ public class SpawnerHunt extends Module {
     private void handleTargetExploration() {
         if (mc.player == null || !BaritoneUtils.IS_AVAILABLE) return;
 
-        // Create a goal using our target settings. The Y value doesn't matter because we will tell Baritone to ignore it.
-        BlockPos goal = new BlockPos(targetX.get(), mc.player.getBlockY(), targetZ.get());
+        int x = targetX.get();
+        int z = targetZ.get();
 
-        // Only issue a new Baritone command if we aren't already pathing to this exact target,
-        // or if Baritone was stopped (e.g., after mining a spawner).
-        if (explorationTarget == null || !explorationTarget.equals(goal) || !PathManagers.get().isPathing()) {
-            explorationTarget = goal;
+        boolean alreadyTargeting = explorationTarget != null
+            && explorationTarget.getX() == x
+            && explorationTarget.getZ() == z;
 
-            // The 'true' argument here is critical. It creates a GoalXZ, ignoring elevation.
+        if (!alreadyTargeting || !PathManagers.get().isPathing()) {
+            explorationTarget = new BlockPos(x, mc.player.getBlockY(), z);
             PathManagers.get().moveTo(explorationTarget, true);
             pathOwnedByModule = true;
         }
@@ -457,10 +490,7 @@ public class SpawnerHunt extends Module {
             if (stuckTimer >= STUCK_CONFIRM_INTERVAL) {
                 if (currentPos.equals(firstStuckCheckPos)) {
                     playerIsStuck = true;
-
                     MeteorClient.LOG.info("[SpawnerHunt] Player is stuck.");
-
-                    doRecovery();
                 }
 
                 waitingForConfirmation = false;
@@ -469,14 +499,43 @@ public class SpawnerHunt extends Module {
             }
         }
     }
-
+    private final Set<BlockPos> unreachableSpawners = new HashSet<>();
+    private int recoveryAttemptsForTarget;
 
     private void doRecovery() {
         if (recoveryMineRangeActive) return;
+        if (currentTarget == null) {        // add this — nothing to recover toward
+            playerIsStuck = false;
+            return;
+        }
 
-        recoveryMineRangeActive = true;
+        recoveryAttemptsForTarget++;
 
-        MeteorClient.LOG.info("[SpawnerHunt] Recovery activated. Mine range temporarily increased to 4 blocks.");
+        if (recoveryAttemptsForTarget >= 3 && currentTarget != null) {
+            MeteorClient.LOG.warn("[SpawnerHunt] Giving up on spawner at {} after repeated stuck recovery.",
+                currentTarget.toShortString());
+            unreachableSpawners.add(currentTarget);
+            currentTarget = null;
+            playerIsStuck = false;
+            stopOwnedPathing();
+            recoveryAttemptsForTarget = 0;
+            return; // exits WITHOUT setting recoveryMineRangeActive
+        }
+
+        recoveryMineRangeActive = true; // only reached for the repath case
+        playerIsStuck = false;
+        MeteorClient.LOG.info("[SpawnerHunt] Recovery activated, forcing repath.");
+        if (BaritoneUtils.IS_AVAILABLE) {
+            PathManagers.get().stop();
+            pathOwnedByModule = false;
+        }
+    }
+
+    private void setCurrentTarget(BlockPos newTarget) {
+        if (newTarget != null && !newTarget.equals(currentTarget)) {
+            recoveryAttemptsForTarget = 0;
+        }
+        currentTarget = newTarget;
     }
 
     private void disableRecovery() {
@@ -518,7 +577,7 @@ public class SpawnerHunt extends Module {
         if (mc.player.containerMenu == mc.player.inventoryMenu) return;
 
         // 2. Ensure the GUI has enough slots
-        if (mc.player.containerMenu.slots.size() == 27) return;
+        if (mc.player.containerMenu.slots.size() <= 27) return;
 
         // 3. The GUI is open! Increment the tick counter.
         rtpGuiWaitTicks++;
@@ -553,7 +612,6 @@ public class SpawnerHunt extends Module {
 
     private void clearExploration() {
         explorationTarget = null;
-        exploreTicks = 0;
     }
 
     private void beginPickupVerification(BlockPos target, int countBeforeMine) {
@@ -584,10 +642,15 @@ public class SpawnerHunt extends Module {
     }
 
     private ItemEntity findNearestSpawnerDrop() {
-        if (mc.level == null || mc.player == null || pendingPickupTarget == null) return null;
+        if (mc.level == null || mc.player == null) return null;
 
-        AABB searchBox = new AABB(pendingPickupTarget).inflate(PICKUP_SEARCH_RANGE);
-        List<ItemEntity> drops = mc.level.getEntitiesOfClass(ItemEntity.class, searchBox, item -> isSpawnerItem(item.getItem()));
+        // Search around the player's current position, not just the spawner.
+        // The item may have fallen or slid away from where the spawner was.
+        AABB searchBox = new AABB(mc.player.blockPosition()).inflate(PICKUP_SEARCH_RANGE);
+
+        List<ItemEntity> drops = mc.level.getEntitiesOfClass(
+            ItemEntity.class, searchBox, item -> isSpawnerItem(item.getItem())
+        );
 
         ItemEntity nearest = null;
         double bestDistSq = Double.MAX_VALUE;
@@ -634,12 +697,14 @@ public class SpawnerHunt extends Module {
     }
 
     private BlockPos findNearestSpawner() {
-        if (mc.player == null || matchingSpawners.isEmpty()) return null;
+        if (mc.player == null || mc.level == null || matchingSpawners.isEmpty()) return null;
 
         BlockPos nearest = null;
         double nearestDistSq = Double.MAX_VALUE;
 
         for (BlockPos pos : matchingSpawners) {
+            if (unreachableSpawners.contains(pos)) continue;
+            if (!mc.level.getWorldBorder().isWithinBounds(pos)) continue; // skip out-of-border
             double distSq = squaredDistanceTo(pos);
             if (distSq < nearestDistSq) {
                 nearestDistSq = distSq;
