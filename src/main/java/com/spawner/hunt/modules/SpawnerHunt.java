@@ -44,6 +44,7 @@ public class SpawnerHunt extends Module {
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgAutomation = settings.createGroup("Automation");
+    private final SettingGroup sgStealth = settings.createGroup("Stealth");
     private final SettingGroup sgRender = settings.createGroup("Render");
 
     public enum ExplorationMode {
@@ -164,6 +165,31 @@ public class SpawnerHunt extends Module {
     );
 
 
+    private final Setting<Boolean> stayBelowMaxY = sgStealth.add(new BoolSetting.Builder()
+        .name("stay-below-max-y")
+        .description("Returns to below a specified Y level after mining a spawner above it.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> maxYLevel = sgStealth.add(new IntSetting.Builder()
+        .name("max-y-level")
+        .description("The maximum Y level to stay below.")
+        .defaultValue(32)
+        .sliderRange(-64, 319)
+        .visible(stayBelowMaxY::get)
+        .build()
+    );
+
+    private final Setting<Boolean> digDownBeforeRtp = sgStealth.add(new BoolSetting.Builder()
+        .name("dig-down-before-rtp")
+        .description("Digs down below the max Y level and waits 5 seconds before RTPing if no spawners are found.")
+        .defaultValue(true)
+        .visible(() -> explorationMode.get() == ExplorationMode.RTP && stayBelowMaxY.get())
+        .build()
+    );
+
+
     private final Setting<Boolean> tracers = sgRender.add(new BoolSetting.Builder()
         .name("tracers")
         .description("Draws a tracer from your eye position to each matching spawner.")
@@ -208,6 +234,10 @@ public class SpawnerHunt extends Module {
     private int spawnerScanCooldown;
     private int waitingForTeleportTicks;
 
+    private boolean returningBelowMaxY;
+    private boolean diggingDownForRtp;
+    private int ticksBelowMaxY;
+
 
     public SpawnerHunt() {
         super(Categories.Misc, "SpawnerHunt", "Routes to and mines mob spawners filtered by mob type.");
@@ -234,11 +264,14 @@ public class SpawnerHunt extends Module {
         rtpCooldown = 0;
         rtpStartPos = null;
         recoveryMineRangeActive = false;
-        unreachableSpawners.clear();     // add
-        recoveryAttemptsForTarget = 0;   // add
+        unreachableSpawners.clear();
+        recoveryAttemptsForTarget = 0;
         spawnerScanCooldown = 0;
         waitingForTeleportTicks = 0;
 
+        returningBelowMaxY = false;
+        diggingDownForRtp = false;
+        ticksBelowMaxY = 0;
     }
 
     @EventHandler
@@ -275,7 +308,6 @@ public class SpawnerHunt extends Module {
             updateMatchingSpawners();
         }
 
-
         if (waitingForTeleport && rtpStartPos != null) {
             waitingForTeleportTicks++;
             double dist = mc.player.position().distanceTo(rtpStartPos);
@@ -293,10 +325,10 @@ public class SpawnerHunt extends Module {
         if (!verifySpawnerPickup.get() && pendingPickupTarget != null) {
             clearPickupVerification();
             stopOwnedPathing();
+            checkAndSetReturningBelowMaxY();
         }
 
         if (verifySpawnerPickup.get() && handlePickupVerification()) return;
-
 
         if (!useBaritone.get()) {
             currentTarget = null;
@@ -318,8 +350,13 @@ public class SpawnerHunt extends Module {
 
         warnedBaritoneUnavailable = false;
 
-        if (matchingSpawners.isEmpty()) {
+        if (matchingSpawners.isEmpty() || findNearestSpawner() == null) {
             currentTarget = null;
+
+            if (returningBelowMaxY) {
+                handleReturningBelowMaxY();
+                return;
+            }
 
             switch (explorationMode.get()) {
                 case None:
@@ -328,8 +365,16 @@ public class SpawnerHunt extends Module {
                     break;
                 case RTP:
                     clearExploration();
-                    stopOwnedPathing();
-                    rtpPlayer();
+                    if (waitingForRtpGui || waitingForTeleport) {
+                        stopOwnedPathing();
+                        break;
+                    }
+                    if (stayBelowMaxY.get() && digDownBeforeRtp.get()) {
+                        handleRtpDigDown();
+                    } else {
+                        stopOwnedPathing();
+                        rtpPlayer();
+                    }
                     break;
                 case TargetCoordinates:
                     handleTargetExploration();
@@ -339,23 +384,21 @@ public class SpawnerHunt extends Module {
             return;
         }
 
+        returningBelowMaxY = false;
+        diggingDownForRtp = false;
+        ticksBelowMaxY = 0;
+
         clearExploration();
 
         BlockPos nearest = findNearestSpawner();
-        if (nearest == null) {
-            currentTarget = null;
-            stopOwnedPathing();
-            return;
-        }
-
 
         if (currentTarget == null
             || !matchingSpawners.contains(currentTarget)
             || !mc.level.getWorldBorder().isWithinBounds(currentTarget)) {
-            setCurrentTarget(nearest); // was: currentTarget = nearest;
+            setCurrentTarget(nearest);
             pathToCurrentTarget();
         } else if (dynamicReroute.get() && shouldReroute(nearest)) {
-            setCurrentTarget(nearest); // was: currentTarget = nearest;
+            setCurrentTarget(nearest);
             pathToCurrentTarget();
         } else if (!isWithinMineRange(currentTarget)) {
             ticksSincePathRefresh++;
@@ -372,7 +415,11 @@ public class SpawnerHunt extends Module {
                 mineTargetSpawner(currentTarget);
 
                 if (!mc.level.getBlockState(currentTarget).is(Blocks.SPAWNER)) {
-                    if (verifySpawnerPickup.get()) beginPickupVerification(currentTarget, beforeMineSpawnerCount);
+                    if (verifySpawnerPickup.get()) {
+                        beginPickupVerification(currentTarget, beforeMineSpawnerCount);
+                    } else {
+                        checkAndSetReturningBelowMaxY();
+                    }
                     currentTarget = null;
                 }
             }
@@ -391,6 +438,7 @@ public class SpawnerHunt extends Module {
         if (countSpawnerItemsInInventory() > expectedSpawnerItemCount) {
             clearPickupVerification();
             stopOwnedPathing();
+            checkAndSetReturningBelowMaxY();
             return false;
         }
 
@@ -400,6 +448,7 @@ public class SpawnerHunt extends Module {
             MeteorClient.LOG.warn("[SpawnerHunt] Timed out trying to confirm pickup for mined spawner at {}.", pendingPickupTarget.toShortString());
             clearPickupVerification();
             stopOwnedPathing();
+            checkAndSetReturningBelowMaxY();
             return false;
         }
 
@@ -408,9 +457,6 @@ public class SpawnerHunt extends Module {
             return true;
         }
 
-        // If already within Minecraft's auto-collect range (~2 blocks), just
-        // wait — repathing to the same spot causes Baritone to immediately stop
-        // without actually moving the player onto the item.
         double dropDistSq = mc.player.distanceToSqr(drop.getX(), drop.getY(), drop.getZ());
         if (dropDistSq <= 4.0) {
             return true;
@@ -419,7 +465,7 @@ public class SpawnerHunt extends Module {
         if (BaritoneUtils.IS_AVAILABLE) {
             pickupPathRefreshTicks++;
 
-            if (!PathManagers.get().isPathing() || pickupPathRefreshTicks >= 5) { // 5 ticks, not repathDelay
+            if (!PathManagers.get().isPathing() || pickupPathRefreshTicks >= 5) {
                 PathManagers.get().moveTo(drop.blockPosition(), false);
                 pathOwnedByModule = true;
                 pickupPathRefreshTicks = 0;
@@ -427,6 +473,59 @@ public class SpawnerHunt extends Module {
         }
 
         return true;
+    }
+
+    private void checkAndSetReturningBelowMaxY() {
+        if (stayBelowMaxY.get() && mc.player != null && mc.player.getBlockY() > maxYLevel.get()) {
+            returningBelowMaxY = true;
+        }
+    }
+
+    private void handleReturningBelowMaxY() {
+        if (mc.player == null) return;
+
+        if (mc.player.getBlockY() <= maxYLevel.get()) {
+            returningBelowMaxY = false;
+            stopOwnedPathing();
+            return;
+        }
+
+        if (!PathManagers.get().isPathing() || !pathOwnedByModule) {
+            BlockPos targetPos = new BlockPos(mc.player.getBlockX(), maxYLevel.get(), mc.player.getBlockZ());
+            PathManagers.get().moveTo(targetPos, false);
+            pathOwnedByModule = true;
+        }
+    }
+
+    private void handleRtpDigDown() {
+        if (mc.player == null) return;
+
+        if (mc.player.getBlockY() > maxYLevel.get()) {
+            diggingDownForRtp = true;
+            ticksBelowMaxY = 0;
+
+            if (!PathManagers.get().isPathing() || !pathOwnedByModule) {
+                BlockPos targetPos = new BlockPos(mc.player.getBlockX(), maxYLevel.get(), mc.player.getBlockZ());
+                PathManagers.get().moveTo(targetPos, false);
+                pathOwnedByModule = true;
+            }
+        } else {
+            if (!diggingDownForRtp) {
+                diggingDownForRtp = true;
+                ticksBelowMaxY = 0;
+            }
+
+            stopOwnedPathing();
+            ticksBelowMaxY++;
+
+            if (ticksBelowMaxY >= 100) {
+                if (rtpCooldown <= 0) {
+                    diggingDownForRtp = false;
+                    ticksBelowMaxY = 0;
+                    rtpPlayer();
+                }
+            }
+        }
     }
 
     private void handleTargetExploration() {
@@ -446,9 +545,8 @@ public class SpawnerHunt extends Module {
         }
     }
 
-
-    private static final int STUCK_CHECK_INTERVAL = 200;      // 10 seconds
-    private static final int STUCK_CONFIRM_INTERVAL = 100;    // 5 seconds
+    private static final int STUCK_CHECK_INTERVAL = 200;
+    private static final int STUCK_CONFIRM_INTERVAL = 100;
 
     private BlockPos firstStuckCheckPos;
     private int stuckTimer;
@@ -463,7 +561,6 @@ public class SpawnerHunt extends Module {
 
         stuckTimer++;
 
-        // First check after 10 seconds
         if (!waitingForConfirmation) {
             if (stuckTimer >= STUCK_CHECK_INTERVAL) {
                 if (firstStuckCheckPos == null) {
@@ -471,22 +568,16 @@ public class SpawnerHunt extends Module {
                     stuckTimer = 0;
                 } else {
                     if (currentPos.equals(firstStuckCheckPos)) {
-                        // Same position after 10 seconds
                         waitingForConfirmation = true;
                         stuckTimer = 0;
                     } else {
-
                         firstStuckCheckPos = currentPos.immutable();
                         stuckTimer = 0;
-
                         disableRecovery();
                     }
                 }
             }
-        }
-
-        // Confirmation check after another 5 seconds
-        else {
+        } else {
             if (stuckTimer >= STUCK_CONFIRM_INTERVAL) {
                 if (currentPos.equals(firstStuckCheckPos)) {
                     playerIsStuck = true;
@@ -499,12 +590,13 @@ public class SpawnerHunt extends Module {
             }
         }
     }
+
     private final Set<BlockPos> unreachableSpawners = new HashSet<>();
     private int recoveryAttemptsForTarget;
 
     private void doRecovery() {
         if (recoveryMineRangeActive) return;
-        if (currentTarget == null) {        // add this — nothing to recover toward
+        if (currentTarget == null) {
             playerIsStuck = false;
             return;
         }
@@ -519,10 +611,10 @@ public class SpawnerHunt extends Module {
             playerIsStuck = false;
             stopOwnedPathing();
             recoveryAttemptsForTarget = 0;
-            return; // exits WITHOUT setting recoveryMineRangeActive
+            return;
         }
 
-        recoveryMineRangeActive = true; // only reached for the repath case
+        recoveryMineRangeActive = true;
         playerIsStuck = false;
         MeteorClient.LOG.info("[SpawnerHunt] Recovery activated, forcing repath.");
         if (BaritoneUtils.IS_AVAILABLE) {
@@ -556,41 +648,26 @@ public class SpawnerHunt extends Module {
         disableRecovery();
     }
 
-
     private Vec3 rtpStartPos;
-
     private boolean waitingForTeleport;
-
-
-
     private boolean waitingForRtpGui;
-
     private int rtpGuiWaitTicks;
-
     private int rtpCooldown;
 
     private void handleRtpGui() {
         if (mc.player == null) return;
         if (mc.player.containerMenu == null) return;
 
-        // 1. Wait until the server actually opens the new GUI
         if (mc.player.containerMenu == mc.player.inventoryMenu) return;
-
-        // 2. Ensure the GUI has enough slots
         if (mc.player.containerMenu.slots.size() <= 27) return;
 
-        // 3. The GUI is open! Increment the tick counter.
         rtpGuiWaitTicks++;
-
         int chestSlot = rtpChestSlot.get();
 
-        // 4. If we haven't waited 10 ticks yet, return and wait for the next tick.
         if (rtpGuiWaitTicks < 10) return;
 
-        // 5. 10 ticks have passed, execute the click!
         InvUtils.click().slotId(chestSlot);
 
-        // 6. Reset the states for the next time you RTP
         waitingForRtpGui = false;
         waitingForTeleport = true;
         rtpGuiWaitTicks = 0;
@@ -644,8 +721,6 @@ public class SpawnerHunt extends Module {
     private ItemEntity findNearestSpawnerDrop() {
         if (mc.level == null || mc.player == null) return null;
 
-        // Search around the player's current position, not just the spawner.
-        // The item may have fallen or slid away from where the spawner was.
         AABB searchBox = new AABB(mc.player.blockPosition()).inflate(PICKUP_SEARCH_RANGE);
 
         List<ItemEntity> drops = mc.level.getEntitiesOfClass(
@@ -687,7 +762,6 @@ public class SpawnerHunt extends Module {
 
             String entityId = resolveEntityId(spawner, pos);
 
-            // Check if our list of targeted mobs contains the spawner's entity ID
             if (entityId != null && filters.contains(entityId)) {
                 matchingSpawners.add(pos);
             }
@@ -704,7 +778,7 @@ public class SpawnerHunt extends Module {
 
         for (BlockPos pos : matchingSpawners) {
             if (unreachableSpawners.contains(pos)) continue;
-            if (!mc.level.getWorldBorder().isWithinBounds(pos)) continue; // skip out-of-border
+            if (!mc.level.getWorldBorder().isWithinBounds(pos)) continue;
             double distSq = squaredDistanceTo(pos);
             if (distSq < nearestDistSq) {
                 nearestDistSq = distSq;
