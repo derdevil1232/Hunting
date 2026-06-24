@@ -17,6 +17,9 @@ import meteordevelopment.meteorclient.utils.render.RenderUtils;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
@@ -28,11 +31,8 @@ import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.SpawnerBlockEntity;
-import net.minecraft.world.level.ChunkPos;
-import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
-import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -49,7 +49,6 @@ public class SpawnerHunt extends Module {
     private final SettingGroup sgAutomation = settings.createGroup("Automation");
     private final SettingGroup sgStealth = settings.createGroup("Stealth");
     private final SettingGroup sgRender = settings.createGroup("Render");
-    private final SettingGroup sgPacketCheck = settings.createGroup("Packet Checking");
 
     public enum ExplorationMode {
         None,
@@ -193,6 +192,12 @@ public class SpawnerHunt extends Module {
         .build()
     );
 
+    private final Setting<Boolean> DungeonPacketmethod = sgStealth.add(new BoolSetting.Builder()
+        .name("dungeon-packet-method")
+        .description("Uses an anticheat bypass method that prevents anti esp plugins on servers.")
+        .defaultValue(false)
+        .build()
+    );
 
     private final Setting<Boolean> tracers = sgRender.add(new BoolSetting.Builder()
         .name("tracers")
@@ -222,51 +227,9 @@ public class SpawnerHunt extends Module {
         .build()
     );
 
-    private final Setting<Boolean> packetCheckEnabled = sgPacketCheck.add(new BoolSetting.Builder()
-        .name("packet-check")
-        .description("Enables seed-based dungeon prediction and packet probing to find spawners beyond render distance.")
-        .defaultValue(false)
-        .build()
-    );
-
-    private final Setting<String> worldSeed = sgPacketCheck.add(new StringSetting.Builder()
-        .name("world-seed")
-        .description("The world seed used to calculate dungeon positions. Required for packet checking.")
-        .defaultValue("")
-        .visible(packetCheckEnabled::get)
-        .build()
-    );
-
-    private final Setting<Integer> packetCheckRadius = sgPacketCheck.add(new IntSetting.Builder()
-        .name("packet-check-radius")
-        .description("Chunk radius around the player to scan for predicted dungeons.")
-        .defaultValue(32)
-        .min(1)
-        .sliderRange(1, 64)
-        .visible(packetCheckEnabled::get)
-        .build()
-    );
-
-    private final Setting<Integer> packetProbeDelay = sgPacketCheck.add(new IntSetting.Builder()
-        .name("probe-delay")
-        .description("Ticks between sending position probe packets to avoid anti-cheat detection.")
-        .defaultValue(5)
-        .min(1)
-        .sliderRange(1, 40)
-        .visible(packetCheckEnabled::get)
-        .build()
-    );
-
-    private final Setting<Boolean> packetCheckNotify = sgPacketCheck.add(new BoolSetting.Builder()
-        .name("probe-notify")
-        .description("Send chat messages when probing or detecting spawners via packets.")
-        .defaultValue(true)
-        .visible(packetCheckEnabled::get)
-        .build()
-    );
-
     private final List<BlockPos> matchingSpawners = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final Map<BlockPos, String> fallbackEntityIdCache = new HashMap<>();
+    private final Set<BlockPos> packetedDungeons = new HashSet<>(); // NEW: Prevents packet spam
 
     private BlockPos currentTarget;
     private BlockPos explorationTarget;
@@ -281,25 +244,10 @@ public class SpawnerHunt extends Module {
     private int spawnerScanCooldown;
     private int waitingForTeleportTicks;
 
+
     private boolean returningBelowMaxY;
     private boolean diggingDownForRtp;
     private int ticksBelowMaxY;
-
-    // === Packet Checking State ===
-    private long parsedSeed;
-    private boolean seedValid;
-    private final List<BlockPos> predictedDungeons = new ArrayList<>();
-    private final Set<BlockPos> probedPositions = new HashSet<>();
-    private final Set<BlockPos> confirmedPacketSpawners = new HashSet<>();
-    private final List<BlockPos> probeQueue = new ArrayList<>();
-    private int probeTickCounter;
-    private int lastPlayerChunkX = Integer.MIN_VALUE;
-    private int lastPlayerChunkZ = Integer.MIN_VALUE;
-    private boolean packetCheckRecalcNeeded = true;
-
-    // Pre-calculated population seed constants (derived from world seed)
-    private long populationSeedA;
-    private long populationSeedB;
 
 
     public SpawnerHunt() {
@@ -307,15 +255,10 @@ public class SpawnerHunt extends Module {
     }
 
     @Override
-    public void onActivate() {
-        initializeSeed();
-        packetCheckRecalcNeeded = true;
-    }
-
-    @Override
     public void onDeactivate() {
         matchingSpawners.clear();
         fallbackEntityIdCache.clear();
+        packetedDungeons.clear();
         currentTarget = null;
         clearExploration();
         clearPickupVerification();
@@ -341,17 +284,6 @@ public class SpawnerHunt extends Module {
         returningBelowMaxY = false;
         diggingDownForRtp = false;
         ticksBelowMaxY = 0;
-
-        // Packet checking cleanup
-        predictedDungeons.clear();
-        probedPositions.clear();
-        confirmedPacketSpawners.clear();
-        probeQueue.clear();
-        probeTickCounter = 0;
-        seedValid = false;
-        lastPlayerChunkX = Integer.MIN_VALUE;
-        lastPlayerChunkZ = Integer.MIN_VALUE;
-        packetCheckRecalcNeeded = true;
     }
 
     @EventHandler
@@ -365,6 +297,11 @@ public class SpawnerHunt extends Module {
             stopOwnedPathing();
             return;
         }
+
+        if (DungeonPacketmethod.get() && mc.player.tickCount % 20 == 0) {
+            FindMossyCobblestone();
+        }
+
         if (rtpCooldown > 0) rtpCooldown--;
 
         if (waitingForRtpGui) {
@@ -387,9 +324,6 @@ public class SpawnerHunt extends Module {
             spawnerScanCooldown = 0;
             updateMatchingSpawners();
         }
-
-        // Packet-based spawner detection
-        tickPacketCheck();
 
         if (waitingForTeleport && rtpStartPos != null) {
             waitingForTeleportTicks++;
@@ -454,7 +388,7 @@ public class SpawnerHunt extends Module {
                     }
                     if (stayBelowMaxY.get() && digDownBeforeRtp.get()) {
                         handleRtpDigDown();
-                    } else {
+                    }else {
                         stopOwnedPathing();
                         rtpPlayer();
                     }
@@ -579,6 +513,77 @@ public class SpawnerHunt extends Module {
             pathOwnedByModule = true;
         }
     }
+
+    private void FindMossyCobblestone() {
+        if (mc.level == null || mc.player == null) return;
+
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        BlockPos.MutableBlockPos neighborPos = new BlockPos.MutableBlockPos();
+
+        int playerChunkX = mc.player.getBlockX() >> 4;
+        int playerChunkZ = mc.player.getBlockZ() >> 4;
+        int chunkRadius = 3;
+
+        for (int chunkX = playerChunkX - chunkRadius; chunkX <= playerChunkX + chunkRadius; chunkX++) {
+            for (int chunkZ = playerChunkZ - chunkRadius; chunkZ <= playerChunkZ + chunkRadius; chunkZ++) {
+
+                if (!mc.level.hasChunk(chunkX, chunkZ)) continue;
+
+                int startX = chunkX << 4;
+                int startZ = chunkZ << 4;
+                int mossyFoundInChunk = 0;
+
+                chunkScan:
+                for (int y = -64; y <= 50; y++) {
+                    for (int x = startX; x < startX + 16; x++) {
+                        for (int z = startZ; z < startZ + 16; z++) {
+                            pos.set(x, y, z);
+
+                            if (mc.level.getBlockState(pos).is(Blocks.MOSSY_COBBLESTONE)) {
+
+                                int nearbyMossy = 0;
+                                for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.values()) {
+                                    neighborPos.setWithOffset(pos, dir);
+
+                                    if (mc.level.getBlockState(neighborPos).is(Blocks.MOSSY_COBBLESTONE)) {
+                                        nearbyMossy++;
+                                    }
+                                }
+
+                                if (nearbyMossy >= 2) {
+                                    BlockPos clusterCenter = pos.immutable();
+
+                                    // Check if we have already spoofed our location to this specific dungeon
+                                    if (!packetedDungeons.contains(clusterCenter)) {
+                                        packetedDungeons.add(clusterCenter);
+
+                                        // Send the packet 1.5 blocks ABOVE the mossy cobblestone.
+                                        // This places your spoofed hitbox dead-center in the room right next to the spawner,
+                                        // ensuring the server's 1-block anti-xray radius is triggered.
+                                        SendDungeonPacket(x + 0.5, y + 1.5, z + 0.5);
+                                    }
+
+                                    mossyFoundInChunk++;
+
+                                    if (mossyFoundInChunk >= 2) {
+                                        break chunkScan;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void SendDungeonPacket(double x, double y, double z) {
+        if (mc.player == null) return;
+        ServerboundMovePlayerPacket packet = new ServerboundMovePlayerPacket.Pos(x, y, z, mc.player.onGround(), true);
+        mc.player.connection.send(packet);
+    }
+
+
 
     private void handleRtpDigDown() {
         if (mc.player == null) return;
@@ -969,7 +974,7 @@ public class SpawnerHunt extends Module {
 
     @EventHandler
     private void onRender3d(Render3DEvent event) {
-        if (mc.level == null || mc.player == null || RenderUtils.center == null) return;
+        if (mc.level == null || mc.player == null || matchingSpawners.isEmpty() || RenderUtils.center == null) return;
 
         for (BlockPos pos : matchingSpawners) {
             if (box.get()) {
@@ -982,291 +987,6 @@ public class SpawnerHunt extends Module {
                 double z = pos.getZ() + 0.5;
 
                 event.renderer.line(RenderUtils.center.x, RenderUtils.center.y, RenderUtils.center.z, x, y, z, tracerColor.get());
-            }
-        }
-
-        // Render packet-check confirmed spawners with a distinct color
-        if (packetCheckEnabled.get()) {
-            for (BlockPos pos : confirmedPacketSpawners) {
-                if (!matchingSpawners.contains(pos)) {
-                    // Render unfiltered packet-confirmed spawners in yellow
-                    if (box.get()) {
-                        event.renderer.box(pos,
-                            new SettingColor(255, 255, 0, 75),
-                            new SettingColor(255, 255, 0, 75),
-                            ShapeMode.Both, 0);
-                    }
-
-                    if (tracers.get()) {
-                        double x = pos.getX() + 0.5;
-                        double y = pos.getY() + 0.5;
-                        double z = pos.getZ() + 0.5;
-                        event.renderer.line(
-                            RenderUtils.center.x, RenderUtils.center.y, RenderUtils.center.z,
-                            x, y, z,
-                            new SettingColor(255, 255, 0, 255)
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // ========================
-    // DUNGEON POSITION PREDICTION
-    // ========================
-
-    /**
-     * Parses and validates the world seed from the setting.
-     */
-    private void initializeSeed() {
-        String seedStr = worldSeed.get().trim();
-        if (seedStr.isEmpty()) {
-            seedValid = false;
-            return;
-        }
-
-        try {
-            parsedSeed = Long.parseLong(seedStr);
-        } catch (NumberFormatException e) {
-            // Non-numeric seed: hash it like Minecraft does
-            parsedSeed = seedStr.hashCode();
-        }
-
-        seedValid = true;
-
-        // Pre-calculate the population seed constants from the world seed
-        java.util.Random seedRng = new java.util.Random(parsedSeed);
-        populationSeedA = seedRng.nextLong() | 1L;
-        populationSeedB = seedRng.nextLong() | 1L;
-    }
-
-    /**
-     * Calculates the population seed for a given chunk, matching Minecraft's
-     * WorldgenRandom.setPopulationSeed() logic.
-     */
-    private long getPopulationSeed(int chunkX, int chunkZ) {
-        long blockX = (long) chunkX * 16;
-        long blockZ = (long) chunkZ * 16;
-        return (blockX * populationSeedA + blockZ * populationSeedB) ^ parsedSeed;
-    }
-
-    /**
-     * Calculates the feature seed for a specific feature placement.
-     * step = GenerationStep.Decoration ordinal (3 for UNDERGROUND_STRUCTURES)
-     * index = feature index within that step's feature list
-     */
-    private long getFeatureSeed(long populationSeed, int index, int step) {
-        return populationSeed + index + 10000L * step;
-    }
-
-    /**
-     * Predicts dungeon candidate positions for a given chunk using the world seed.
-     * Returns a list of BlockPos where dungeons MAY generate (before terrain validation).
-     *
-     * The algorithm mirrors Minecraft's dungeon placement pipeline:
-     *   1. count(10) - 10 attempts for normal dungeons
-     *   2. in_square - random X/Z spread within chunk
-     *   3. height_range(uniform, 0 to 256) - random Y
-     */
-    private List<BlockPos> predictDungeonPositions(int chunkX, int chunkZ) {
-        List<BlockPos> candidates = new ArrayList<>();
-
-        // UNDERGROUND_STRUCTURES step = 3
-        // Feature index within that step varies by biome, but typically 0 or low
-        // We try indices 0-2 to cover most biomes
-        for (int featureIndex = 0; featureIndex <= 2; featureIndex++) {
-            long popSeed = getPopulationSeed(chunkX, chunkZ);
-            long featSeed = getFeatureSeed(popSeed, featureIndex, 3);
-            java.util.Random rng = new java.util.Random(featSeed);
-
-            // count modifier: 10 attempts for normal dungeons
-            int attempts = 10;
-
-            for (int attempt = 0; attempt < attempts; attempt++) {
-                // in_square placement modifier: random position within chunk
-                int x = chunkX * 16 + rng.nextInt(16);
-                int z = chunkZ * 16 + rng.nextInt(16);
-
-                // height_range: uniform between 0 and world height (256 for overworld)
-                int y = rng.nextInt(256);
-
-                candidates.add(new BlockPos(x, y, z));
-
-                // Consume the RNG calls that place() would make even on failure
-                // halfWidth1 = nextInt(2) + 2
-                rng.nextInt(2);
-                // halfWidth2 = nextInt(2) + 2
-                rng.nextInt(2);
-            }
-        }
-
-        // Also handle deep dungeons (monster_room_deep) - 4 attempts, negative Y
-        for (int featureIndex = 0; featureIndex <= 2; featureIndex++) {
-            long popSeed = getPopulationSeed(chunkX, chunkZ);
-            // Deep dungeons likely have a different feature index; try offset
-            long featSeed = getFeatureSeed(popSeed, featureIndex + 3, 3);
-            java.util.Random rng = new java.util.Random(featSeed);
-
-            int attempts = 4;
-
-            for (int attempt = 0; attempt < attempts; attempt++) {
-                int x = chunkX * 16 + rng.nextInt(16);
-                int z = chunkZ * 16 + rng.nextInt(16);
-                int y = -64 + rng.nextInt(64); // -64 to 0 for deep dungeons
-
-                candidates.add(new BlockPos(x, y, z));
-                rng.nextInt(2);
-                rng.nextInt(2);
-            }
-        }
-
-        return candidates;
-    }
-
-    // ========================
-    // PACKET PROBING
-    // ========================
-
-    /**
-     * Recalculates predicted dungeon positions for chunks within the scan radius.
-     */
-    private void recalculatePredictedDungeons() {
-        if (mc.player == null || !seedValid) return;
-
-        int playerChunkX = mc.player.getBlockX() >> 4;
-        int playerChunkZ = mc.player.getBlockZ() >> 4;
-        int radius = packetCheckRadius.get();
-
-        predictedDungeons.clear();
-        probeQueue.clear();
-
-        for (int cx = playerChunkX - radius; cx <= playerChunkX + radius; cx++) {
-            for (int cz = playerChunkZ - radius; cz <= playerChunkZ + radius; cz++) {
-                List<BlockPos> candidates = predictDungeonPositions(cx, cz);
-                for (BlockPos pos : candidates) {
-                    if (!probedPositions.contains(pos) && !confirmedPacketSpawners.contains(pos)) {
-                        predictedDungeons.add(pos);
-                    }
-                }
-            }
-        }
-
-        // Sort by distance to player - probe closest first
-        predictedDungeons.sort((a, b) -> {
-            double distA = mc.player.blockPosition().distSqr(a);
-            double distB = mc.player.blockPosition().distSqr(b);
-            return Double.compare(distA, distB);
-        });
-
-        probeQueue.addAll(predictedDungeons);
-
-        lastPlayerChunkX = playerChunkX;
-        lastPlayerChunkZ = playerChunkZ;
-        packetCheckRecalcNeeded = false;
-    }
-
-    /**
-     * Sends a position spoof packet to the server to force chunk loading around a target.
-     * Uses ServerboundMovePlayerPacket.Pos with x, y, z coordinates.
-     */
-    private void sendProbePacket(BlockPos target) {
-        if (mc.player == null || mc.player.connection == null) return;
-
-        double x = target.getX() + 0.5;
-        double y = target.getY() + 0.5;
-        double z = target.getZ() + 0.5;
-
-        // Send position packet to force server to load chunks around the target
-        mc.player.connection.send(new ServerboundMovePlayerPacket.Pos(
-            x, y, z, mc.player.onGround(), false
-        ));
-
-        // Immediately send real position back to minimize desync
-        mc.player.connection.send(new ServerboundMovePlayerPacket.Pos(
-            mc.player.getX(), mc.player.getY(), mc.player.getZ(), mc.player.onGround(), mc.player.horizontalCollision
-        ));
-    }
-
-    /**
-     * Checks if a spawner exists at the given position by examining loaded block entities.
-     */
-    private boolean checkForSpawnerAt(BlockPos pos) {
-        if (mc.level == null) return false;
-
-        // Check if the chunk containing this position is loaded
-        int chunkX = pos.getX() >> 4;
-        int chunkZ = pos.getZ() >> 4;
-        LevelChunk chunk = mc.level.getChunkSource().getChunkNow(chunkX, chunkZ);
-
-        if (chunk == null) return false;
-
-        // Check if there's a spawner block at the position
-        if (mc.level.getBlockState(pos).is(Blocks.SPAWNER)) {
-            BlockEntity be = mc.level.getBlockEntity(pos);
-            return be instanceof SpawnerBlockEntity;
-        }
-
-        return false;
-    }
-
-    /**
-     * Main tick handler for the packet checking system.
-     * Called from onTick.
-     */
-    private void tickPacketCheck() {
-        if (!packetCheckEnabled.get() || mc.player == null || mc.level == null) return;
-
-        // Re-parse seed each time (cheap operation, ensures setting changes are picked up)
-        initializeSeed();
-        if (!seedValid) return;
-
-        // Check if player has moved to a new chunk - recalculate predictions
-        int playerChunkX = mc.player.getBlockX() >> 4;
-        int playerChunkZ = mc.player.getBlockZ() >> 4;
-
-        if (playerChunkX != lastPlayerChunkX || playerChunkZ != lastPlayerChunkZ || packetCheckRecalcNeeded) {
-            recalculatePredictedDungeons();
-        }
-
-        // Check previously probed positions for spawners that may now be loaded
-        List<BlockPos> toRemove = new ArrayList<>();
-        for (BlockPos probed : probedPositions) {
-            if (checkForSpawnerAt(probed)) {
-                if (confirmedPacketSpawners.add(probed)) {
-                    if (packetCheckNotify.get()) {
-                        info("\u00a7a[Packet Check] \u00a7fSpawner confirmed at \u00a7e" +
-                            probed.getX() + " " + probed.getY() + " " + probed.getZ());
-                    }
-
-                    // Also add to the main matching spawners list if it matches the mob filter
-                    BlockEntity be = mc.level.getBlockEntity(probed);
-                    if (be instanceof SpawnerBlockEntity spawner) {
-                        String entityId = resolveEntityId(spawner, probed);
-                        if (entityId != null && mobFilter.get().contains(entityId)) {
-                            if (!matchingSpawners.contains(probed)) {
-                                matchingSpawners.add(probed);
-                            }
-                        }
-                    }
-                }
-                toRemove.add(probed);
-            }
-        }
-        probedPositions.removeAll(toRemove);
-
-        // Send probe packets on delay
-        probeTickCounter++;
-        if (probeTickCounter >= packetProbeDelay.get() && !probeQueue.isEmpty()) {
-            probeTickCounter = 0;
-
-            BlockPos target = probeQueue.remove(0);
-            probedPositions.add(target);
-            sendProbePacket(target);
-
-            if (packetCheckNotify.get()) {
-                info("\u00a77[Packet Check] \u00a7fProbing \u00a7e" +
-                    target.getX() + " " + target.getY() + " " + target.getZ());
             }
         }
     }
