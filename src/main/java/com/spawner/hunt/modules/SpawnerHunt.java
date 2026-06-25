@@ -21,6 +21,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Registry;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.tags.ItemTags;
@@ -299,7 +300,7 @@ public class SpawnerHunt extends Module {
         }
 
         if (DungeonPacketmethod.get() && mc.player.tickCount % 20 == 0) {
-            FindMossyCobblestone();
+            ScanDungeonAttempts();
         }
 
         if (rtpCooldown > 0) rtpCooldown--;
@@ -514,62 +515,75 @@ public class SpawnerHunt extends Module {
         }
     }
 
-    private void FindMossyCobblestone() {
+    private final Setting<Integer> worldSeed = sgStealth.add(new IntSetting.Builder()
+        .name("world-seed")
+        .description("The known world seed used to calculate dungeon coordinates.")
+        .defaultValue(0)
+        .sliderRange(-30000000, 30000000)
+        .build()
+    );
+
+    private void ScanDungeonAttempts() {
         if (mc.level == null || mc.player == null) return;
 
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-        BlockPos.MutableBlockPos neighborPos = new BlockPos.MutableBlockPos();
+        var registry = mc.level.registryAccess().lookup(Registries.PLACED_FEATURE).orElse(null);
+        if (registry == null) return;
+
+        var keys = registry.listElementIds().toList();
+        var monsterRoomKey = keys.stream()
+            .filter(k -> k.toString().contains("monster_room"))
+            .findFirst().orElse(null);
+        if (monsterRoomKey == null) return;
+
+        int featureIdx = keys.indexOf(monsterRoomKey);
+        if (featureIdx == -1) return;
 
         int playerChunkX = mc.player.getBlockX() >> 4;
         int playerChunkZ = mc.player.getBlockZ() >> 4;
         int chunkRadius = 3;
+
+        long seed = worldSeed.get();
+        if (seed == 0) return; // Need a seed to predict
+
+        // Initialize Minecraft's native ChunkRandom with the modern Xoroshiro128++ engine
+        net.minecraft.world.level.levelgen.XoroshiroRandomSource xoroshiroRandom = new net.minecraft.world.level.levelgen.XoroshiroRandomSource(0L);
+        net.minecraft.world.level.levelgen.WorldgenRandom random = new net.minecraft.world.level.levelgen.WorldgenRandom(xoroshiroRandom);
 
         for (int chunkX = playerChunkX - chunkRadius; chunkX <= playerChunkX + chunkRadius; chunkX++) {
             for (int chunkZ = playerChunkZ - chunkRadius; chunkZ <= playerChunkZ + chunkRadius; chunkZ++) {
 
                 if (!mc.level.hasChunk(chunkX, chunkZ)) continue;
 
-                int startX = chunkX << 4;
-                int startZ = chunkZ << 4;
-                int mossyFoundInChunk = 0;
+                // 1. Initialize Modern Feature Seed
+                random.setFeatureSeed(seed, featureIdx, net.minecraft.world.level.levelgen.GenerationStep.Decoration.UNDERGROUND_STRUCTURES.ordinal());
 
-                chunkScan:
-                for (int y = -64; y <= 50; y++) {
-                    for (int x = startX; x < startX + 16; x++) {
-                        for (int z = startZ; z < startZ + 16; z++) {
-                            pos.set(x, y, z);
+                // 2. Loop 8 Attempts
+                // 2. Loop 8 Attempts
+                for (int attempt = 0; attempt < 8; attempt++) {
+                    // EXACT PRNG Call Order from wasm decompilation
+                    int localX = random.nextInt(16);
+                    int y = random.nextInt(114) - 64; // nextInt(114) - 64 covers Y=-64 to Y=49 (1.21 height bounds)
+                    int localZ = random.nextInt(16);
+                    int sizeX = random.nextInt(2) + 2;
+                    int sizeZ = random.nextInt(2) + 2;
 
-                            if (mc.level.getBlockState(pos).is(Blocks.MOSSY_COBBLESTONE)) {
+                    int absoluteX = (chunkX << 4) + localX;
+                    int absoluteZ = (chunkZ << 4) + localZ;
 
-                                int nearbyMossy = 0;
-                                for (net.minecraft.core.Direction dir : net.minecraft.core.Direction.values()) {
-                                    neighborPos.setWithOffset(pos, dir);
+                    BlockPos attemptPos = new BlockPos(absoluteX, y, absoluteZ);
 
-                                    if (mc.level.getBlockState(neighborPos).is(Blocks.MOSSY_COBBLESTONE)) {
-                                        nearbyMossy++;
-                                    }
-                                }
+                    // Check if we have already spoofed our location to this specific attempt
+                    if (!packetedDungeons.contains(attemptPos)) {
 
-                                if (nearbyMossy >= 2) {
-                                    BlockPos clusterCenter = pos.immutable();
+                        // --- THE DISTANCE GATE (Restored) ---
+                        // Calculate the squared distance from the player to the attempt
+                        double distSq = mc.player.distanceToSqr(absoluteX + 0.5, y + 1.5, absoluteZ + 0.5);
+                        double safeDistanceSq = 32.0 * 32.0; // 32 block trigger radius
 
-                                    // Check if we have already spoofed our location to this specific dungeon
-                                    if (!packetedDungeons.contains(clusterCenter)) {
-                                        packetedDungeons.add(clusterCenter);
-
-                                        // Send the packet 1.5 blocks ABOVE the mossy cobblestone.
-                                        // This places your spoofed hitbox dead-center in the room right next to the spawner,
-                                        // ensuring the server's 1-block anti-xray radius is triggered.
-                                        SendDungeonPacket(x + 0.5, y + 1.5, z + 0.5);
-                                    }
-
-                                    mossyFoundInChunk++;
-
-                                    if (mossyFoundInChunk >= 2) {
-                                        break chunkScan;
-                                    }
-                                }
-                            }
+                        // Only send the packet if the player is physically close enough
+                        if (distSq <= safeDistanceSq) {
+                            packetedDungeons.add(attemptPos);
+                            SendDungeonPacket(absoluteX + 0.5, y + 1.5, absoluteZ + 0.5);
                         }
                     }
                 }
