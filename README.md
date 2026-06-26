@@ -69,10 +69,9 @@ Hunter is a Meteor Client addon that automates the process of finding, traveling
 ```
 
 ## TODOs
-- [ ] Update `maven_group` in `gradle.properties` (currently `com.example`).
-- [ ] Update `archives_base_name` in `gradle.properties` (currently `addon-template`).
-- [ ] Update `rootProject.name` in `settings.gradle.kts` (currently `addon-template`).
 - [ ] Add unit tests for spawner detection logic.
+- [ ] Test new seed method of dungeon calculation wirh different anti esps
+- [ ] Test on aternos server for anti cheat detections
 
 ## License
 This project is licensed under the [CC0 1.0 Universal](LICENSE) license. Feel free to use it for your own projects.
