@@ -528,23 +528,24 @@ public class SpawnerHunt extends Module {
 
         var registry = mc.level.registryAccess().lookup(Registries.PLACED_FEATURE).orElse(null);
         if (registry == null) return;
+        ChatUtils.Info("Registry passed");
 
         var keys = registry.listElementIds().toList();
         var monsterRoomKey = keys.stream()
             .filter(k -> k.toString().contains("monster_room"))
             .findFirst().orElse(null);
         if (monsterRoomKey == null) return;
-
+        ChatUtils.Info("Monster Room found");
         int featureIdx = keys.indexOf(monsterRoomKey);
         if (featureIdx == -1) return;
-
+        ChatUtils.Info("Feature Index found");
         int playerChunkX = mc.player.getBlockX() >> 4;
         int playerChunkZ = mc.player.getBlockZ() >> 4;
         int chunkRadius = 3;
 
         long seed = worldSeed.get();
         if (seed == 0) return; // Need a seed to predict
-
+        ChatUtils.Info("Seed found");
         // Initialize Minecraft's native ChunkRandom with the modern Xoroshiro128++ engine
         net.minecraft.world.level.levelgen.XoroshiroRandomSource xoroshiroRandom = new net.minecraft.world.level.levelgen.XoroshiroRandomSource(0L);
         net.minecraft.world.level.levelgen.WorldgenRandom random = new net.minecraft.world.level.levelgen.WorldgenRandom(xoroshiroRandom);
